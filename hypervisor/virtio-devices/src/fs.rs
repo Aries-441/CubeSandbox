@@ -272,6 +272,13 @@ impl FsEpollHandler {
         paused: Arc<AtomicBool>,
         paused_sync: Arc<Barrier>,
     ) -> result::Result<(), EpollHelperError> {
+        // Passthrough xattr operations temporarily change CWD through procfs.
+        // Give each worker its own filesystem state, as standalone virtiofsd does.
+        // Safe because unshare does not access userspace memory.
+        if unsafe { libc::unshare(libc::CLONE_FS) } < 0 {
+            return Err(EpollHelperError::IoError(std::io::Error::last_os_error()));
+        }
+
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
 
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
