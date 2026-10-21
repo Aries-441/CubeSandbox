@@ -5,20 +5,40 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Return the process-wide lock that serializes tests using the proc-fd xattr
+/// path.  The daemon workers call unshare(CLONE_FS) so each thread has its own
+/// CWD and umask; tests hold this lock instead because unshare may be blocked
+/// by CI container seccomp policies.
+fn cwd_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 struct Fixture {
     fs: PassthroughFs,
     path: PathBuf,
     ctx: Context,
+    saved_umask: libc::mode_t,
+    _cwd_lock: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new(xattr: bool) -> Self {
-        // PassthroughFs changes CWD for proc-fd xattr calls and sets the umask.
-        // Keep these changes local to this test thread, as in the daemon workers.
-        // Safe because unshare does not access userspace memory.
-        assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
+        // Hold the serialization lock for the Fixture's lifetime so that no two
+        // xattr tests run concurrently and race on the process CWD or umask.
+        // unwrap_or_else recovers from lock poisoning caused by a previous panic
+        // so that one failing test does not cascade into all subsequent ones.
+        let _cwd_lock = cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Save the current umask before PassthroughFs::new calls umask(0).
+        // Restored in Drop so the change does not leak to unrelated tests.
+        // Safe because umask does not access userspace memory.
+        let saved_umask = unsafe { libc::umask(0o022) };
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -46,7 +66,13 @@ impl Fixture {
                 pid: libc::getpid(),
             }
         };
-        Self { fs, path, ctx }
+        Self {
+            fs,
+            path,
+            ctx,
+            saved_umask,
+            _cwd_lock,
+        }
     }
 
     fn inode(&self, name: &str) -> Inode {
@@ -65,6 +91,10 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // Restore the umask that PassthroughFs::new changed so we do not leave
+        // umask(0) in place for unrelated tests that run after this one.
+        // Safe because umask does not access userspace memory.
+        unsafe { libc::umask(self.saved_umask) };
         fs::remove_dir_all(&self.path).unwrap();
     }
 }
